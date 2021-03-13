@@ -44,8 +44,6 @@ class DCM(QtCore.QObject):
         camonitor("bIICurrent:Mnt1", writer=self.pv_monitor)
 
         self.control = None
-        self.twf = False
-        self.twr = False
         self.window.getValues.clicked.connect(self.calc_hold_values)
         self.window.control_activate.toggled.connect(self.dcm_controller)
         self.window.kSignal.textChanged.connect(self.calc_norm)
@@ -53,10 +51,16 @@ class DCM(QtCore.QObject):
         self.window.kSignal_hold.textChanged.connect(self.allow_to_activate)
         self.window.normSignal_hold.textChanged.connect(self.allow_to_activate)
 
-        self.log = open("/soft/prog/BAMlineHelper/logs/dcmController-log_%s.txt" % time.ctime(), "x")
+        home_dir = os.path.expanduser("~")
+        dcm_log_dir = home_dir + "/DCMController-logs"
+        if not os.path.exists(dcm_log_dir):
+            os.makedirs(dcm_log_dir)
+
+        self.log = open("%s/dcmController-log_%s.txt" % (dcm_log_dir, time.ctime()), "w")
         print('%s DCM - controller started' % time.ctime())
-        print('log is being saved to /soft/prog/BAMlineHelper/logs/dcmController-log_%s.txt' % time.ctime())
+        print("%s/dcmController-log_%s.txt" % (dcm_log_dir, time.ctime()))
         self.log.write('%s DCM - controller started' % time.ctime())
+        self.log.flush()
 
     def pv_monitor(self, pv_value):
 
@@ -99,6 +103,8 @@ class DCM(QtCore.QObject):
 
     def dcm_controller(self):
 
+        self.log.flush()
+
         if self.window.control_activate.isChecked() is True:
 
             if self.control is None:  # in case the controller has been activated
@@ -131,16 +137,24 @@ class DCM(QtCore.QObject):
             nb_state = caget("BS02R02U102L:State")
             # only valid if dcm_e is between 6 and 60keV
             dcm_e = caget("Energ:25002000rbv")
+            # only if the beamstop is lower than the dcm-beamoffset and done moving
+            dcm_offset = caget("Energ:25002000z2.B")
+            beamstop = caget("OMS58:25003001.RBV")
+            beamstop_offset = dcm_offset - beamstop
+            beamstop_done_moving = caget("OMS58:25003001.DMOV")
 
-            # take action (there is something wrong if diff is half the signal...)
-            if threshold > diff > 10 and nb_state == 2 and 6 < dcm_e < 60:
+            # take action (there is something wrong if diff is less than 10% signal...)
+            if threshold > diff > 10 and nb_state == 2 and 6 < dcm_e < 60 and beamstop_offset > 0 and \
+                    beamstop_done_moving == 1:
+                tweak_forward = False
+                tweak_back = False
                 self.log.write('\n%s low signal detected: %.2f%%' % (time.ctime(), diff))
                 print('%s low signal detected: %.2f%%' % (time.ctime(), diff))
                 tweak_step = self.window.piezo_tweak.value()
                 tweak_value = caget("PI662:Piezo1.TWV")
                 if tweak_step != tweak_value:
-                    self.log.write('\n%s putting tweak-value to %.3f' % (time.ctime(), tweak_value))
-                    print('%s putting tweak-value to %.3f' % (time.ctime(), tweak_value))
+                    self.log.write('\n%s putting tweak-value to %.3f' % (time.ctime(), tweak_step))
+                    print('%s putting tweak-value to %.3f' % (time.ctime(), tweak_step))
                     caput("PI662:Piezo1.TWV", tweak_step)
 
                 # tweak once to get direction, wait 2s for keithely
@@ -157,7 +171,7 @@ class DCM(QtCore.QObject):
                 if new_signal > act_signal:
                     self.log.write('\n%s yes, tweaking forward is the right direction!' % time.ctime())
                     print('%s yes, tweaking forward is the right direction!' % time.ctime())
-                    self.twf = True
+                    tweak_forward = True
                 else:
                     self.log.write('\n%s nope, now tweaking twice reverse...' % time.ctime())
                     print('%s nope, now tweaking twice reverse...' % time.ctime())
@@ -174,17 +188,16 @@ class DCM(QtCore.QObject):
                     if new_signal > act_signal:
                         self.log.write('\n%s yes, tweaking reverse is the right direction!' % time.ctime())
                         print('%s yes, tweaking reverse is the right direction!' % time.ctime())
-                        self.twr = True
+                        tweak_back = True
                     else:
                         caput("PI662:Piezo1.TWF", 1)
                         time.sleep(2)
                         self.log.write('\n%s nope, signal is not rising... i do nothing' % time.ctime())
                         print('%s nope, signal is not rising... i do nothing' % time.ctime())
-                        self.twf = False
-                        self.twr = False
-                        self.window.control_activate.setChecked(False)
+                        # put the original user-tweak-value
+                        caput("PI662:Piezo1.TWV", tweak_value)
 
-                if self.twf:
+                if tweak_forward:
                     if self.window.monitor_normSignal.isChecked():
                         while new_signal > act_signal:
                             act_signal = float(self.window.normSignal.text())
@@ -215,7 +228,7 @@ class DCM(QtCore.QObject):
                     caput("PI662:Piezo1.TWR", 1)
                     time.sleep(2)
 
-                if self.twr:
+                if tweak_back:
                     if self.window.monitor_normSignal.isChecked():
                         while new_signal > act_signal:
                             act_signal = float(self.window.normSignal.text())
@@ -246,7 +259,7 @@ class DCM(QtCore.QObject):
                     caput("PI662:Piezo1.TWF", 1)
                     time.sleep(2)
 
-                if self.twf or self.twf:
+                if tweak_forward or tweak_back:
                     if self.window.monitor_normSignal.isChecked():
                         act_signal = self.window.normSignal.text()
                         self.log.write('\n%s the new normed signal to hold is: %s' % (time.ctime(), act_signal))
@@ -259,6 +272,9 @@ class DCM(QtCore.QObject):
                         print('%s the new keithley signal to hold is: %s' % (time.ctime(), act_signal))
                         self.window.kSignal_hold.setText(self.window.kSignal.text())
                         time.sleep(1)
+
+                    # put the original user-tweak-value
+                    caput("PI662:Piezo1.TWV", tweak_value)
 
         else:
             self.control.cancel()  # terminates the controller
