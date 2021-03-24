@@ -6,7 +6,7 @@ import sys
 import threading  # Timer für den DCM-Controller
 import time
 import helper_calc as calc
-from epics import caget, caput, camonitor
+from epics import caget, caput, camonitor, camonitor_clear
 from PySide2 import QtWidgets, QtUiTools, QtCore
 import pyqtgraph as pg
 #pg.setConfigOption('background', 'w')  # Plothintergrund weiß (2D)
@@ -50,6 +50,7 @@ class DCM(QtCore.QObject):
         self.window.ringcurrent.textChanged.connect(self.calc_norm)
         self.window.kSignal_hold.textChanged.connect(self.allow_to_activate)
         self.window.normSignal_hold.textChanged.connect(self.allow_to_activate)
+        self.window.manually.toggled.connect(self.monitor_manually)
 
         home_dir = os.path.expanduser("~")
         dcm_log_dir = home_dir + "/DCMController-logs"
@@ -69,6 +70,18 @@ class DCM(QtCore.QObject):
             self.window.kSignal.setText(value)
         if pv == "bIICurrent:Mnt1":
             self.window.ringcurrent.setText("{:.6s}".format(value))
+        if pv == "eveCSS:scan":
+            if value == 'Go':
+                self.window.manually_status.setText('Status: Checking')
+            else:
+                self.window.manually_status.setText('Status: Idle')
+
+    def monitor_manually(self):
+
+        if self.window.manually.isChecked():
+            camonitor("eveCSS:scan", writer=self.pv_monitor)
+        else:
+            camonitor_clear("eveCSS:scan")
 
     def calc_norm(self):
 
@@ -119,8 +132,11 @@ class DCM(QtCore.QObject):
                     self.log.write('\nkeithley signal to hold %.5e' % hold_signal)
                     print('keithley signal to hold %.5e' % hold_signal)
 
-            self.control = threading.Timer(self.window.t_pruef.value(), self.dcm_controller)
-            self.control.start()
+            if self.window.manually.isChecked:
+                print('manual control selected')
+            else:
+                self.control = threading.Timer(self.window.t_pruef.value(), self.dcm_controller)
+                self.control.start()
 
             # calc the difference in percent
             if self.window.monitor_normSignal.isChecked():
