@@ -7,7 +7,8 @@ import threading  # Timer für den DCM-Controller
 import time
 import helper_calc as calc
 from epics import caget, caput, camonitor, camonitor_clear
-from PySide2 import QtWidgets, QtUiTools, QtCore
+from PySide2 import QtWidgets, QtUiTools, QtCore, QtGui
+from PySide2.QtCore import QRunnable, Slot, QThreadPool, QObject, Signal
 import pyqtgraph as pg
 #pg.setConfigOption('background', 'w')  # Plothintergrund weiß (2D)
 #pg.setConfigOption('foreground', 'k')  # Plotvordergrund schwarz (2D)
@@ -34,13 +35,88 @@ def load_ui(fname):
         return window
 
 
+class Worker(QRunnable):
+    """
+    Worker thread, for more info see:
+    https://www.learnpyqt.com/tutorials/multithreading-pyqt-applications-qthreadpool/
+
+    Inherits from QRunnable to handler worker thread setup, signals and wrap-up.
+
+    :param callback: The function callback to run on this worker thread. Supplied args and
+                     kwargs will be passed through to the runner.
+    :type callback: function
+    :param args: Arguments to pass to the callback function
+    :param kwargs: Keywords to pass to the callback function
+
+    """
+
+    def __init__(self, fn, *args, **kwargs):
+        super(Worker, self).__init__()
+
+        # Store constructor arguments (re-used for processing)
+        self.fn = fn
+        self.args = args
+        self.kwargs = kwargs
+        self.signals = WorkerSignals()
+
+        # Add the callback to our kwargs
+        self.kwargs['progress_callback'] = self.signals.progress
+
+    @Slot()
+    def run(self):
+        """
+        Initialise the runner function with passed args, kwargs.
+        """
+        self.fn(*self.args, **self.kwargs)
+        # # Retrieve args/kwargs here; and fire processing using them
+        # try:
+        #     result = self.fn(*self.args, **self.kwargs)
+        # except:
+        #     traceback.print_exc()
+        #     exctype, value = sys.exc_info()[:2]
+        #     self.signals.error.emit((exctype, value, traceback.format_exc()))
+        # else:
+        #     self.signals.result.emit(result)  # Return the result of the processing
+        # finally:
+        #     self.signals.finished.emit()  # Done
+        self.signals.finished.emit()  # Done
+
+
+class WorkerSignals(QObject):
+    """
+    Defines the signals available from a running worker thread.
+
+    Supported signals are:
+
+    finished
+        No data
+
+    error
+        tuple (exctype, value, traceback.format_exc() )
+
+    result
+        object data returned from processing, anything
+
+    progress
+        int indicating % progress or 0/1 fore not done/done
+
+    """
+    finished = Signal()
+    # error = Signal(tuple)
+    # result = Signal(object)
+    progress = Signal(int)
+
+
 class DCM(QtCore.QObject):
     def __init__(self):
         super(DCM, self).__init__()
         self.window = load_ui(os.path.join(DIR_PATH, 'dcmController.ui'))
         self.window.installEventFilter(self)
 
-        camonitor("K6485:miocb0113", writer=self.pv_monitor)
+        self.threadpool = QThreadPool()
+
+        self.ioni_pv = self.window.ioniPv.text()
+        camonitor(self.ioni_pv, writer=self.pv_monitor)
         camonitor("bIICurrent:Mnt1", writer=self.pv_monitor)
 
         self.control = None
@@ -48,13 +124,14 @@ class DCM(QtCore.QObject):
         self.window.getValues_topo.clicked.connect(self.topo_hold_values)
         self.window.control_activate.toggled.connect(self.dcm_controller)
         self.window.manually.toggled.connect(self.monitor_manually)
+        self.window.ioniPv.returnPressed.connect(self.clear_and_set_monitor)
         self.window.add_topo.toggled.connect(self.monitor_pco1600)
         self.window.triggered_topo.toggled.connect(self.monitor_topo)
-        self.window.manually_status.textChanged.connect(self.dcm_controller_manually)
-        self.window.topo_status.textChanged.connect(self.topo_controller)
-        self.window.kSignal.textChanged.connect(self.calc_norm)
+        self.window.manually_status.textChanged.connect(self.dcm_controller_manually_thread)
+        self.window.topo_status.textChanged.connect(self.topo_controller_thread)
+        self.window.IoniSignal.textChanged.connect(self.calc_norm)
         self.window.ringcurrent.textChanged.connect(self.calc_norm)
-        self.window.kSignal_hold.textChanged.connect(self.allow_to_activate)
+        self.window.IoniSignal_hold.textChanged.connect(self.allow_to_activate)
         self.window.normSignal_hold.textChanged.connect(self.allow_to_activate)
         self.window.mean_hold.textChanged.connect(self.allow_to_activate_topo)
 
@@ -72,8 +149,8 @@ class DCM(QtCore.QObject):
     def pv_monitor(self, pv_value):
 
         pv, date, zeit, value = pv_value.split()
-        if pv == "K6485:miocb0113":
-            self.window.kSignal.setText(value)
+        if pv == self.ioni_pv:
+            self.window.IoniSignal.setText(value)
         if pv == "bIICurrent:Mnt1":
             self.window.ringcurrent.setText("{:.6s}".format(value))
         if pv == "PCO1600:Stats1:MeanValue_RBV":
@@ -88,6 +165,18 @@ class DCM(QtCore.QObject):
                 self.window.topo_status.setText('Topo Status: Checking')
             else:
                 self.window.topo_status.setText('Topo Status: Idle')
+
+    def clear_and_set_monitor(self):
+
+        self.log.write('\n%s cleared' % self.ioni_pv)
+        print('%s cleared' % self.ioni_pv)
+        camonitor_clear(self.ioni_pv)
+        self.window.IoniSignal.setText('0')
+
+        self.ioni_pv = self.window.ioniPv.text()
+        camonitor(self.ioni_pv, writer=self.pv_monitor)
+        self.log.write('\n%s entered' % self.ioni_pv)
+        print('%s entered' % self.ioni_pv)
 
     def monitor_pco1600(self):
 
@@ -118,8 +207,8 @@ class DCM(QtCore.QObject):
 
     def calc_norm(self):
 
-        if self.window.kSignal.text():  # when calc_norm is called before k_signal has a value
-            k_value = float(self.window.kSignal.text())
+        if self.window.IoniSignal.text():  # when calc_norm is called before k_signal has a value
+            k_value = float(self.window.IoniSignal.text())
         else:
             k_value = 0
         if self.window.ringcurrent.text():  # when calc_norm is called before ringcurrent has a value
@@ -135,7 +224,7 @@ class DCM(QtCore.QObject):
 
     def calc_hold_values(self):
 
-        self.window.kSignal_hold.setText(self.window.kSignal.text())
+        self.window.IoniSignal_hold.setText(self.window.IoniSignal.text())
         self.window.normSignal_hold.setText(self.window.normSignal.text())
 
     def topo_hold_values(self):
@@ -155,7 +244,7 @@ class DCM(QtCore.QObject):
     def allow_to_activate(self):
 
         if self.window.monitor_normSignal.isChecked() and calc.isfloat(self.window.normSignal_hold.text()) is True or \
-                self.window.monitor_kSignal.isChecked() and calc.isfloat(self.window.kSignal_hold.text()) is True:
+                self.window.monitor_IoniSignal.isChecked() and calc.isfloat(self.window.IoniSignal_hold.text()) is True:
             self.window.control_activate.setEnabled(1)
             self.window.manually.setEnabled(1)
         else:
@@ -193,9 +282,9 @@ class DCM(QtCore.QObject):
                     self.log.write('\nnormed Signal to hold %.5e' % hold_signal)
                     print('normed Signal to hold %.5e' % hold_signal)
                 else:
-                    hold_signal = float(self.window.kSignal_hold.text())
-                    self.log.write('\nkeithley signal to hold %.5e' % hold_signal)
-                    print('keithley signal to hold %.5e' % hold_signal)
+                    hold_signal = float(self.window.IoniSignal_hold.text())
+                    self.log.write('\nIoni signal to hold %.5e' % hold_signal)
+                    print('Ioni signal to hold %.5e' % hold_signal)
 
             self.control = threading.Timer(self.window.t_pruef.value(), self.dcm_controller)
             self.control.start()
@@ -205,8 +294,8 @@ class DCM(QtCore.QObject):
                 hold_signal = float(self.window.normSignal_hold.text())
                 act_signal = float(self.window.normSignal.text())
             else:
-                hold_signal = float(self.window.kSignal_hold.text())
-                act_signal = float(self.window.kSignal.text())
+                hold_signal = float(self.window.IoniSignal_hold.text())
+                act_signal = float(self.window.IoniSignal.text())
 
             diff = act_signal / hold_signal * 100
             threshold = self.window.threshold.value()
@@ -215,10 +304,12 @@ class DCM(QtCore.QObject):
             nb_state = caget("BS02R02U102L:State")
             # only valid if dcm_e is between 6 and 60keV
             dcm_e = caget("Energ:25002000rbv")
-            # only if the beamstop is lower than the dcm-beamoffset and done moving
+            # only if the beamstop is lower than the dcm- + dmm-offset and done moving
+            # dmm-offset determined via dcm-y
             dcm_offset = caget("Energ:25002000z2.B")
+            dcm_y = caget("OMS58:25001007")
             beamstop = caget("OMS58:25003001.RBV")
-            beamstop_offset = dcm_offset - beamstop
+            beamstop_offset = (dcm_offset + dcm_y) - beamstop
             beamstop_done_moving = caget("OMS58:25003001.DMOV")
 
             # take action (there is something wrong if diff is less than 10% signal...)
@@ -244,7 +335,7 @@ class DCM(QtCore.QObject):
                 if self.window.monitor_normSignal.isChecked():
                     new_signal = float(self.window.normSignal.text())
                 else:
-                    new_signal = float(self.window.kSignal.text())
+                    new_signal = float(self.window.IoniSignal.text())
 
                 if new_signal > act_signal:
                     self.log.write('\n%s yes, tweaking forward is the right direction!' % time.ctime())
@@ -261,7 +352,7 @@ class DCM(QtCore.QObject):
                     if self.window.monitor_normSignal.isChecked():
                         new_signal = float(self.window.normSignal.text())
                     else:
-                        new_signal = float(self.window.kSignal.text())
+                        new_signal = float(self.window.IoniSignal.text())
 
                     if new_signal > act_signal:
                         self.log.write('\n%s yes, tweaking reverse is the right direction!' % time.ctime())
@@ -290,16 +381,16 @@ class DCM(QtCore.QObject):
                             print('%s the new normed signal is: %.5e' % (time.ctime(), new_signal))
                     else:
                         while new_signal > act_signal:
-                            act_signal = float(self.window.kSignal.text())
-                            self.log.write('\n%s the keithley signal is: %.5e' % (time.ctime(), act_signal))
+                            act_signal = float(self.window.IoniSignal.text())
+                            self.log.write('\n%s the Ioni signal is: %.5e' % (time.ctime(), act_signal))
                             self.log.write('\ntweaking forward')
-                            print('%s the keithley signal is: %.5e' % (time.ctime(), act_signal))
+                            print('%s the Ioni signal is: %.5e' % (time.ctime(), act_signal))
                             print('tweaking forward')
                             caput("PI662:Piezo1.TWF", 1)
                             time.sleep(2)
-                            new_signal = float(self.window.kSignal.text())
-                            self.log.write('\n%s the new keithley signal is: %.5e' % (time.ctime(), new_signal))
-                            print('%s the new keithley signal is: %.5e' % (time.ctime(), new_signal))
+                            new_signal = float(self.window.IoniSignal.text())
+                            self.log.write('\n%s the new Ioni signal is: %.5e' % (time.ctime(), new_signal))
+                            print('%s the new Ioni signal is: %.5e' % (time.ctime(), new_signal))
 
                     self.log.write('\ntweaking once back...')
                     print('tweaking once back...')
@@ -321,16 +412,16 @@ class DCM(QtCore.QObject):
                             print('%s the new normed signal is: %.5e' % (time.ctime(), new_signal))
                     else:
                         while new_signal > act_signal:
-                            act_signal = float(self.window.kSignal.text())
-                            self.log.write('\n%s the keithley signal is: %.5e' % (time.ctime(), act_signal))
+                            act_signal = float(self.window.IoniSignal.text())
+                            self.log.write('\n%s the Ioni signal is: %.5e' % (time.ctime(), act_signal))
                             self.log.write('\ntweaking reverse')
-                            print('%s the keithley signal is: %.5e' % (time.ctime(), act_signal))
+                            print('%s the Ioni signal is: %.5e' % (time.ctime(), act_signal))
                             print('tweaking reverse')
                             caput("PI662:Piezo1.TWR", 1)
                             time.sleep(2)
-                            new_signal = float(self.window.kSignal.text())
-                            self.log.write('\n%s the new keithley signal is: %.5e' % (time.ctime(), new_signal))
-                            print('%s the new keithley signal is: %.5e' % (time.ctime(), new_signal))
+                            new_signal = float(self.window.IoniSignal.text())
+                            self.log.write('\n%s the new Ioni signal is: %.5e' % (time.ctime(), new_signal))
+                            print('%s the new Ioni signal is: %.5e' % (time.ctime(), new_signal))
 
                     self.log.write('\ntweaking once forward...')
                     print('tweaking once forward...')
@@ -345,10 +436,10 @@ class DCM(QtCore.QObject):
                         self.window.normSignal_hold.setText(self.window.normSignal.text())
                         time.sleep(1)
                     else:
-                        act_signal = self.window.kSignal.text()
-                        self.log.write('\n%s the new keithley signal to hold is: %s' % (time.ctime(), act_signal))
-                        print('%s the new keithley signal to hold is: %s' % (time.ctime(), act_signal))
-                        self.window.kSignal_hold.setText(self.window.kSignal.text())
+                        act_signal = self.window.IoniSignal.text()
+                        self.log.write('\n%s the new Ioni signal to hold is: %s' % (time.ctime(), act_signal))
+                        print('%s the new Ioni signal to hold is: %s' % (time.ctime(), act_signal))
+                        self.window.IoniSignal_hold.setText(self.window.IoniSignal.text())
                         time.sleep(1)
 
                     # put the original user-tweak-value
@@ -360,7 +451,21 @@ class DCM(QtCore.QObject):
             self.log.write('\n%s DCM - controller terminated' % time.ctime())
             print('%s DCM - controller terminated' % time.ctime())
 
-    def dcm_controller_manually(self):
+    def dcm_controller_manually_thread(self):
+
+        """Run the dcm-controller in a separate thread in order to not freeze the GUI."""
+
+        worker = Worker(self.dcm_controller_manually)  # Any other args, kwargs are passed to the run function
+        #worker.signals.progress.connect(self.progress_bar)
+        #worker.signals.finished.connect(self.bl_spectrum)
+
+        # Execute
+        self.threadpool.start(worker)
+
+    def dcm_controller_manually(self, progress_callback):
+
+        #done = False
+        #progress_callback.emit(done)
 
         if self.window.manually_status.text() != 'triggered Status: Checking':
             return
@@ -374,17 +479,17 @@ class DCM(QtCore.QObject):
             self.log.write('\nnormed Signal to hold %.5e' % hold_signal)
             print('normed Signal to hold %.5e' % hold_signal)
         else:
-            hold_signal = float(self.window.kSignal_hold.text())
-            self.log.write('\nkeithley signal to hold %.5e' % hold_signal)
-            print('keithley signal to hold %.5e' % hold_signal)
+            hold_signal = float(self.window.IoniSignal_hold.text())
+            self.log.write('\nIoni signal to hold %.5e' % hold_signal)
+            print('Ioni signal to hold %.5e' % hold_signal)
 
         # calc the difference in percent
         if self.window.monitor_normSignal.isChecked():
             hold_signal = float(self.window.normSignal_hold.text())
             act_signal = float(self.window.normSignal.text())
         else:
-            hold_signal = float(self.window.kSignal_hold.text())
-            act_signal = float(self.window.kSignal.text())
+            hold_signal = float(self.window.IoniSignal_hold.text())
+            act_signal = float(self.window.IoniSignal.text())
 
         diff = act_signal / hold_signal * 100
         threshold = self.window.threshold.value()
@@ -422,7 +527,7 @@ class DCM(QtCore.QObject):
             if self.window.monitor_normSignal.isChecked():
                 new_signal = float(self.window.normSignal.text())
             else:
-                new_signal = float(self.window.kSignal.text())
+                new_signal = float(self.window.IoniSignal.text())
 
             if new_signal > act_signal:
                 self.log.write('\n%s yes, tweaking forward is the right direction!' % time.ctime())
@@ -439,7 +544,7 @@ class DCM(QtCore.QObject):
                 if self.window.monitor_normSignal.isChecked():
                     new_signal = float(self.window.normSignal.text())
                 else:
-                    new_signal = float(self.window.kSignal.text())
+                    new_signal = float(self.window.IoniSignal.text())
 
                 if new_signal > act_signal:
                     self.log.write('\n%s yes, tweaking reverse is the right direction!' % time.ctime())
@@ -468,16 +573,16 @@ class DCM(QtCore.QObject):
                         print('%s the new normed signal is: %.5e' % (time.ctime(), new_signal))
                 else:
                     while new_signal > act_signal:
-                        act_signal = float(self.window.kSignal.text())
-                        self.log.write('\n%s the keithley signal is: %.5e' % (time.ctime(), act_signal))
+                        act_signal = float(self.window.IoniSignal.text())
+                        self.log.write('\n%s the Ioni signal is: %.5e' % (time.ctime(), act_signal))
                         self.log.write('\ntweaking forward')
-                        print('%s the keithley signal is: %.5e' % (time.ctime(), act_signal))
+                        print('%s the Ioni signal is: %.5e' % (time.ctime(), act_signal))
                         print('tweaking forward')
                         caput("PI662:Piezo1.TWF", 1)
                         time.sleep(2)
-                        new_signal = float(self.window.kSignal.text())
-                        self.log.write('\n%s the new keithley signal is: %.5e' % (time.ctime(), new_signal))
-                        print('%s the new keithley signal is: %.5e' % (time.ctime(), new_signal))
+                        new_signal = float(self.window.IoniSignal.text())
+                        self.log.write('\n%s the new Ioni signal is: %.5e' % (time.ctime(), new_signal))
+                        print('%s the new Ioni signal is: %.5e' % (time.ctime(), new_signal))
 
                 self.log.write('\ntweaking once back...')
                 print('tweaking once back...')
@@ -499,16 +604,16 @@ class DCM(QtCore.QObject):
                         print('%s the new normed signal is: %.5e' % (time.ctime(), new_signal))
                 else:
                     while new_signal > act_signal:
-                        act_signal = float(self.window.kSignal.text())
-                        self.log.write('\n%s the keithley signal is: %.5e' % (time.ctime(), act_signal))
+                        act_signal = float(self.window.IoniSignal.text())
+                        self.log.write('\n%s the Ioni signal is: %.5e' % (time.ctime(), act_signal))
                         self.log.write('\ntweaking reverse')
-                        print('%s the keithley signal is: %.5e' % (time.ctime(), act_signal))
+                        print('%s the Ioni signal is: %.5e' % (time.ctime(), act_signal))
                         print('tweaking reverse')
                         caput("PI662:Piezo1.TWR", 1)
                         time.sleep(2)
-                        new_signal = float(self.window.kSignal.text())
-                        self.log.write('\n%s the new keithley signal is: %.5e' % (time.ctime(), new_signal))
-                        print('%s the new keithley signal is: %.5e' % (time.ctime(), new_signal))
+                        new_signal = float(self.window.IoniSignal.text())
+                        self.log.write('\n%s the new Ioni signal is: %.5e' % (time.ctime(), new_signal))
+                        print('%s the new Ioni signal is: %.5e' % (time.ctime(), new_signal))
 
                 self.log.write('\ntweaking once forward...')
                 print('tweaking once forward...')
@@ -523,10 +628,10 @@ class DCM(QtCore.QObject):
                     self.window.normSignal_hold.setText(self.window.normSignal.text())
                     time.sleep(1)
                 else:
-                    act_signal = self.window.kSignal.text()
-                    self.log.write('\n%s the new keithley signal to hold is: %s' % (time.ctime(), act_signal))
-                    print('%s the new keithley signal to hold is: %s' % (time.ctime(), act_signal))
-                    self.window.kSignal_hold.setText(self.window.kSignal.text())
+                    act_signal = self.window.IoniSignal.text()
+                    self.log.write('\n%s the new Ioni signal to hold is: %s' % (time.ctime(), act_signal))
+                    print('%s the new Ioni signal to hold is: %s' % (time.ctime(), act_signal))
+                    self.window.IoniSignal_hold.setText(self.window.IoniSignal.text())
                     time.sleep(1)
 
                 # put the original user-tweak-value
@@ -538,7 +643,21 @@ class DCM(QtCore.QObject):
         # set back the trigger PV
         caput("DCM:Controller", "Idle")
 
-    def topo_controller(self):
+        #done = True
+        #progress_callback.emit(done)
+
+    def topo_controller_thread(self):
+
+        """Run the dcm-controller in a separate thread in order to not freeze the GUI."""
+
+        worker = Worker(self.topo_controller)  # Any other args, kwargs are passed to the run function
+        #worker.signals.progress.connect(self.progress_bar)
+        #worker.signals.finished.connect(self.bl_spectrum)
+
+        # Execute
+        self.threadpool.start(worker)
+
+    def topo_controller(self, progress_callback):
 
         if self.window.topo_status.text() != 'Topo Status: Checking':
             return
@@ -557,7 +676,7 @@ class DCM(QtCore.QObject):
         caput("PCO1600:cam1:Acquire", 1)
 
         exp_time = caget("PCO1600:cam1:AcquireTime_RBV")
-        wait_time = exp_time + 0.5
+        wait_time = exp_time + 2.
 
         time.sleep(wait_time)
         # calc the difference in percent
@@ -584,12 +703,12 @@ class DCM(QtCore.QObject):
             tweak_back = False
             self.log.write('\n%s low signal detected: %.2f%%' % (time.ctime(), diff))
             print('%s low signal detected: %.2f%%' % (time.ctime(), diff))
-            tweak_step = self.window.piezo_tweak.value()
-            tweak_value = caget("PIE665:Piezo1.TWV")
-            if tweak_step != tweak_value:
-                self.log.write('\n%s putting tweak-value to %.3f' % (time.ctime(), tweak_step))
-                print('%s putting tweak-value to %.3f' % (time.ctime(), tweak_step))
-                caput("PIE665:Piezo1.TWV", tweak_step)
+            tweak_value = self.window.piezo_tweak.value()
+            #tweak_value = caget("PIE665:Piezo1.TWV")
+            #if tweak_step != tweak_value:
+                #self.log.write('\n%s putting tweak-value to %.3f' % (time.ctime(), tweak_step))
+                #print('%s putting tweak-value to %.3f' % (time.ctime(), tweak_step))
+                #caput("PIE665:Piezo1.TWV", tweak_step)
 
             # tweak once to get direction, wait exp_time for camera
             self.log.write('\n%s tweaking once forward to get the right direction...' % time.ctime())
@@ -669,7 +788,7 @@ class DCM(QtCore.QObject):
                 time.sleep(1)
 
                 # put the original user-tweak-value
-                caput("PIE665:Piezo1.TWV", tweak_value)
+                #caput("PIE665:Piezo1.TWV", tweak_value)
         else:
             self.log.write('\n%s no adjustment, if-condition not met' % time.ctime())
             print('%s no adjustment, if-condition not met' % time.ctime())
