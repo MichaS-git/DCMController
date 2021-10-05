@@ -229,6 +229,10 @@ class DCM(QtCore.QObject):
 
     def topo_hold_values(self):
 
+        # get the current camera state, so we can restore it after the procedure
+        image_mode_ini = caget("PCO1600:cam1:ImageMode")
+        auto_save_ini = caget("PCO1600:TIFF1:AutoSave")
+
         caput("PCO1600:cam1:ImageMode", 'Continuous')
         caput("PCO1600:TIFF1:AutoSave", 'No')
         time.sleep(0.2)
@@ -240,6 +244,12 @@ class DCM(QtCore.QObject):
         time.sleep(wait_time)
 
         self.window.mean_hold.setText(self.window.pco1600_mean.text())
+
+        # stop the camera and put it back to the state it was before
+        caput("PCO1600:cam1:Acquire", 0)
+        time.sleep(0.2)
+        caput("PCO1600:cam1:ImageMode", image_mode_ini)
+        caput("PCO1600:TIFF1:AutoSave", auto_save_ini)
 
     def allow_to_activate(self):
 
@@ -670,6 +680,10 @@ class DCM(QtCore.QObject):
         self.log.write('\nPCO1600-mean to hold %.2f' % hold_signal)
         print('PCO1600-mean to hold %.2f' % hold_signal)
 
+        # get the current camera state, so we can restore it after the procedure
+        image_mode_ini = caget("PCO1600:cam1:ImageMode")
+        auto_save_ini = caget("PCO1600:TIFF1:AutoSave")
+
         caput("PCO1600:cam1:ImageMode", 'Continuous')
         caput("PCO1600:TIFF1:AutoSave", 'No')
         time.sleep(0.2)
@@ -793,9 +807,11 @@ class DCM(QtCore.QObject):
             self.log.write('\n%s no adjustment, if-condition not met' % time.ctime())
             print('%s no adjustment, if-condition not met' % time.ctime())
 
-        # stop the camera
+        # stop the camera and put it back to the state it was before
         caput("PCO1600:cam1:Acquire", 0)
         time.sleep(0.2)
+        caput("PCO1600:cam1:ImageMode", image_mode_ini)
+        caput("PCO1600:TIFF1:AutoSave", auto_save_ini)
 
         # set back the trigger PV
         caput("TOPO:Controller", "Idle")
